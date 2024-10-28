@@ -4,7 +4,7 @@ use sonor::utils::find_root_node;
 use super::Result;
 
 pub fn extract_av_transport_last_change(state_xml: &str) -> Result<Vec<(String, String)>> {
-    let doc = Document::parse(&state_xml).map_err(sonor::Error::from)?;
+    let doc = Document::parse(state_xml).map_err(sonor::Error::from)?;
     let state =
         find_root_node(&doc, "InstanceID", "Last Change Variables").map_err(sonor::Error::from)?;
     // let keys = ["CurrentPlayMode", "CurrentTrack", "CurrentCrossfadeMode", "AVTransportURI"];

@@ -18,10 +18,10 @@ use controller::{Controller, SpeakerData};
 use sonor::{Snapshot, Track};
 use types::{CmdSender, Command, Response};
 
-pub(self) use controller::ZoneAction;
+use controller::ZoneAction;
 pub use error::Error;
 pub use mediasource::MediaSource;
-pub(self) use types::Result;
+use types::Result;
 
 use tokio::{sync::oneshot, task::JoinHandle};
 

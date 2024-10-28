@@ -11,6 +11,7 @@ use super::{
     },
     Command, Error, Result,
 };
+
 use futures_util::stream::{SelectAll, StreamExt};
 use log::{debug, warn};
 use sonor::{
@@ -18,6 +19,7 @@ use sonor::{
     urns::{AV_TRANSPORT, ZONE_GROUP_TOPOLOGY},
     Service, Speaker, SpeakerInfo, Uri, URN,
 };
+use std::fmt::Write as _;
 use std::time::Duration;
 use tokio::{select, sync::mpsc};
 use tokio_stream::wrappers::WatchStream;
@@ -201,16 +203,15 @@ impl Controller {
     }
 
     fn get_a_service_and_url(&self, urn: &URN) -> Result<(Service, Uri)> {
-        let speaker;
-        if !self.speakerdata.is_empty() {
+        let speaker = if !self.speakerdata.is_empty() {
             // Chose a random speaker. We may have lost subscription to topology
             // because the last speaker went offline.. and we don't know.
             // There's a chance we can recover quickly if we find an extant speaker.
             let i = fastrand::usize(..self.speakerdata.len());
-            speaker = &self.speakerdata.get(i).unwrap().speaker;
+            &self.speakerdata.get(i).unwrap().speaker
         } else {
             return Err(sonor::Error::NoSpeakersDetected.into());
-        }
+        };
 
         speaker
             .device()
@@ -233,16 +234,17 @@ impl Controller {
             TopoUpdate(_uuid, topology) => {
                 debug!(
                     "Got topology update: {}",
-                    topology
-                        .iter()
-                        .map(|(u, s)| format!(
+                    topology.iter().fold(String::new(), |mut acc, (u, s)| {
+                        let _ = write!(
+                            acc,
                             "{} => {:?}, ",
                             self.get_speaker_by_uuid(u)
                                 .map(|s| s.name())
                                 .unwrap_or_default(),
                             s.iter().map(|i| i.name()).collect::<Vec<&str>>()
-                        ))
-                        .collect::<String>()
+                        );
+                        acc
+                    })
                 );
                 self.update_from_topology(topology)
                     .await
@@ -348,7 +350,7 @@ impl Controller {
         action: ZoneAction,
     ) -> Result<()> {
         debug!("Got {:?}", action);
-        action.handle_action(&self, tx, name).await
+        action.handle_action(self, tx, name).await
     }
 
     /// Run the event loop.
