@@ -1,17 +1,9 @@
 use sonor::{SpeakerInfo, URN};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{Snapshot, Track};
+use crate::{Command, Snapshot, Track};
 
-use super::{Error, ZoneAction};
-
-#[derive(Debug)]
-pub(super) enum Command {
-    DoZoneAction(Responder, ZoneName, ZoneAction),
-    // Browse or search media
-    // Subscribe to events
-    // Management of controller?
-}
+use super::Error;
 
 #[derive(Debug)]
 pub enum Response {
@@ -22,21 +14,21 @@ pub enum Response {
 }
 
 #[derive(Debug, Clone)]
-pub(super) enum Event {
+pub enum Event {
     TopoUpdate(Option<Uuid>, Topology),
     AVTransUpdate(Option<Uuid>, AVStatus),
     SubscribeError(Option<Uuid>, URN),
     NoOp,
 }
 
-pub(crate) type Uuid = String;
-pub(super) type CmdSender = mpsc::Sender<Command>;
-pub(super) type EventReceiver = tokio::sync::watch::Receiver<Event>;
+pub type Uuid = String;
+pub type CmdSender = mpsc::Sender<Command>;
+pub type EventReceiver = tokio::sync::watch::Receiver<Event>;
 
-pub(super) type ReducedTopology = Vec<(Uuid, Vec<Uuid>)>;
-pub(super) type Topology = Vec<(Uuid, Vec<SpeakerInfo>)>;
-pub(super) type AVStatus = Vec<(String, String)>;
-pub(super) type Result<T, E = Error> = std::result::Result<T, E>;
+pub type ReducedTopology = Vec<(Uuid, Vec<Uuid>)>;
+pub type Topology = Vec<(Uuid, Vec<SpeakerInfo>)>;
+pub type AVStatus = Vec<(String, String)>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Type for zone name
 pub type ZoneName = String;

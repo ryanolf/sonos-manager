@@ -4,6 +4,7 @@ use sonor::{RepeatMode, Snapshot, Speaker};
 
 use super::Controller;
 use crate::{
+    controller::SpeakerData,
     types::{Responder, Response},
     Error, MediaSource, Result,
 };
@@ -185,12 +186,12 @@ impl ZoneActionUnsignedNExt for u32 {
 }
 
 trait ZoneActionSignedNExt {
-    async fn seek_rel_track(self, speakerdata: &super::SpeakerData) -> Result<()>;
-    async fn set_rel_volume(self, speaker: &super::Speaker) -> Result<()>;
+    async fn seek_rel_track(self, speakerdata: &SpeakerData) -> Result<()>;
+    async fn set_rel_volume(self, speaker: &Speaker) -> Result<()>;
 }
 
 impl ZoneActionSignedNExt for i32 {
-    async fn seek_rel_track(self, speakerdata: &super::SpeakerData) -> Result<()> {
+    async fn seek_rel_track(self, speakerdata: &SpeakerData) -> Result<()> {
         let cur_track_no: i32 = speakerdata
             .get_current_track_no()
             .await?
@@ -209,7 +210,7 @@ impl ZoneActionSignedNExt for i32 {
         }
     }
 
-    async fn set_rel_volume(self, speaker: &super::Speaker) -> Result<()> {
+    async fn set_rel_volume(self, speaker: &Speaker) -> Result<()> {
         speaker
             .set_volume_relative(self)
             .await

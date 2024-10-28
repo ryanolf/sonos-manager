@@ -10,20 +10,20 @@ mod metadata;
 mod subscriber;
 mod types;
 pub mod utils;
+mod zoneaction;
 
 #[cfg(test)]
 mod test;
 
 use controller::{Controller, SpeakerData};
 use sonor::{Snapshot, Track};
-use types::{CmdSender, Command, Response};
+use tokio::{sync::oneshot, task::JoinHandle};
+use types::Result;
+use types::{CmdSender, Responder, Response, ZoneName};
 
-use controller::ZoneAction;
 pub use error::Error;
 pub use mediasource::MediaSource;
-use types::Result;
-
-use tokio::{sync::oneshot, task::JoinHandle};
+pub use zoneaction::ZoneAction;
 
 #[derive(Default, Debug)]
 pub struct Manager {
@@ -62,11 +62,6 @@ impl<'a> Zone<'a> {
         rx.await.map_err(|_| Error::MessageRecvError)
     }
 
-    pub async fn update_room(&mut self, room_name: String) -> Result<()> {
-        self.name = self.manager.get_zone(room_name).await?.name;
-        Ok(())
-    }
-
     action!(play_now: PlayNow(media: MediaSource) => Ok(__: ()));
     action!(queue_as_next: QueueAsNext(media: MediaSource) => Ok(__: ()));
     action!(play: Play => Ok(__: ()));
@@ -89,18 +84,23 @@ impl<'a> Zone<'a> {
 }
 
 impl Manager {
-    pub async fn new() -> Result<Manager> {
+    /// Try to create a new manager to control the first sonos system found on
+    /// the network. If a system cannot be found, an error is returned.
+    pub async fn try_new() -> Result<Manager> {
         let controller = Controller::new();
-        Self::new_with_controller(controller).await
+        Self::try_new_with_controller(controller).await
     }
 
+    /// Try to create a new manager to control a sonos system that has a
+    /// speaker with a certain room name. If the room name does not match any
+    /// existing system, an error is returned.
     pub async fn new_with_roomname(room: &str) -> Result<Manager> {
         let mut controller = Controller::new();
         controller.seed_by_roomname(room).await?;
-        Self::new_with_controller(controller).await
+        Self::try_new_with_controller(controller).await
     }
 
-    async fn new_with_controller(mut controller: Controller) -> Result<Manager> {
+    async fn try_new_with_controller(mut controller: Controller) -> Result<Manager> {
         let tx = Some(controller.init().await?);
         log::debug!("Initialized controller with devices:");
         for device in controller.speakers().iter() {
@@ -121,6 +121,7 @@ impl Manager {
         })
     }
 
+    /// Get a zone by name. If the zone does not exist, an error is returned.
     pub async fn get_zone(&self, room_name: String) -> Result<Zone<'_>> {
         let zone = Zone {
             manager: self,
@@ -139,4 +140,12 @@ impl Drop for Manager {
         log::debug!("Dropping manager",);
         self.controller_handle.as_ref().map(JoinHandle::abort);
     }
+}
+
+#[derive(Debug)]
+pub enum Command {
+    DoZoneAction(Responder, ZoneName, ZoneAction),
+    // Browse or search media
+    // Subscribe to events
+    // Management of controller?
 }

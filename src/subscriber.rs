@@ -24,19 +24,19 @@ type Sender = tokio::sync::watch::Sender<Event>;
 /// are still receiver handles. Once all receiver handles are dropped, the
 /// subscriber will shutdown and will need to be recreated.
 #[derive(Default, Debug)]
-pub(super) struct Subscriber {
+pub struct Subscriber {
     service: Option<sonor::rupnp::Service>,
     url: Option<sonor::rupnp::http::Uri>,
-    pub(crate) uuid: Option<Uuid>,
+    pub uuid: Option<Uuid>,
     task_handle: Option<JoinHandle<Result<Sender>>>,
 }
 
 impl Subscriber {
-    pub(crate) fn new() -> Subscriber {
+    pub fn new() -> Subscriber {
         Subscriber::default()
     }
 
-    pub(super) fn subscribe(
+    pub fn subscribe(
         &mut self,
         service: sonor::rupnp::Service,
         url: sonor::rupnp::http::Uri,
@@ -67,7 +67,7 @@ impl Subscriber {
     /// listening task re_spawned. The spawned task will return an error via
     /// join handle if the subscription cannot be made or maintained, e.g. the device
     /// goes offline. This function returns an error if service and url are not set.
-    pub(crate) fn spawn_task(&mut self, tx: Sender) -> Result<()> {
+    pub fn spawn_task(&mut self, tx: Sender) -> Result<()> {
         use Event::*;
         let service = self
             .service

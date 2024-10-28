@@ -15,4 +15,4 @@ thiserror = "1.0"
 roxmltree = "0.18"
 
 [dev-dependencies]
-simple_logger = "1.13.0"
+simple_logger = "5.0"

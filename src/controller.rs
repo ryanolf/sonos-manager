@@ -2,13 +2,12 @@
 
 //! API backend for tracking sonos system topology
 
-mod zoneaction;
-
-use super::{
+use crate::{
     subscriber::Subscriber,
     types::{
         AVStatus, CmdSender, Event, EventReceiver, ReducedTopology, Responder, Topology, Uuid,
     },
+    zoneaction::ZoneAction,
     Command, Error, Result,
 };
 
@@ -24,15 +23,13 @@ use std::time::Duration;
 use tokio::{select, sync::mpsc};
 use tokio_stream::wrappers::WatchStream;
 
-pub use zoneaction::ZoneAction;
-
 type CmdReceiver = mpsc::Receiver<Command>;
 
 #[derive(Debug)]
-pub(crate) struct SpeakerData {
-    pub(crate) speaker: Speaker,
+pub struct SpeakerData {
+    pub speaker: Speaker,
     transport_subscription: Option<Subscriber>,
-    pub(crate) transport_data: AVStatus,
+    pub transport_data: AVStatus,
 }
 
 impl SpeakerData {
@@ -46,7 +43,7 @@ impl SpeakerData {
 
     /// Get the current track number for this speaker. Take value from cache if
     /// available, otherwise ask for it.
-    pub(crate) async fn get_current_track_no(&self) -> Result<u32> {
+    pub async fn get_current_track_no(&self) -> Result<u32> {
         match self
             .transport_data
             .iter()
@@ -69,8 +66,8 @@ impl SpeakerData {
 #[derive(Debug, Default)]
 /// The controller owns the Speakers and keeps track of the topology
 /// so it can perform actions using the appropriate coordinating speakers.
-pub(super) struct Controller {
-    speakerdata: Vec<SpeakerData>,
+pub struct Controller {
+    pub speakerdata: Vec<SpeakerData>,
     topology: ReducedTopology,
     topology_subscription: Subscriber,
     queued_event_handles: Vec<EventReceiver>,
@@ -94,6 +91,10 @@ impl Controller {
         Ok(tx)
     }
 
+    /// If there are multiple sonos systems on the network, we can specify that
+    /// we want the discovered system to have a speaker with certain name.
+    /// Otherwise, the first speaker found will define the system and be used
+    /// to build the system topology.
     pub async fn seed_by_roomname(&mut self, name: &str) -> Result<()> {
         log::debug!("Looking for seed {}...", name);
         let maybe_speaker = find(name, Duration::from_secs(5)).await?;
@@ -355,9 +356,9 @@ impl Controller {
 
     /// Run the event loop.
     ///
-    ///     * Subscribe and listen to events on the sonos system
-    ///     * Keep system state up-to-date
-    ///     * Listen for commands from clients to perform actions on zones.
+    /// - Subscribe and listen to events on the sonos system
+    /// - Keep system state up-to-date
+    /// - Listen for commands from clients to perform actions on zones.
     ///
     /// Will return an error if system goes offline.
     ///
@@ -398,7 +399,7 @@ impl Controller {
         Ok(())
     }
 
-    fn get_speaker_with_name(&self, name: &str) -> Option<&Speaker> {
+    pub fn get_speaker_with_name(&self, name: &str) -> Option<&Speaker> {
         self.speakerdata
             .iter()
             .find_map(|s| match s.speaker.name().eq_ignore_ascii_case(name) {
@@ -407,7 +408,7 @@ impl Controller {
             })
     }
 
-    fn get_speaker_by_uuid(&self, uuid: &str) -> Option<&Speaker> {
+    pub fn get_speaker_by_uuid(&self, uuid: &str) -> Option<&Speaker> {
         self.speakerdata
             .iter()
             .find_map(|s| match s.speaker.uuid().eq_ignore_ascii_case(uuid) {
@@ -416,30 +417,30 @@ impl Controller {
             })
     }
 
-    fn get_speakerdata_by_uuid(&self, uuid: &str) -> Option<&SpeakerData> {
+    pub fn get_speakerdata_by_uuid(&self, uuid: &str) -> Option<&SpeakerData> {
         self.speakerdata
             .iter()
             .find(|s| s.speaker.uuid().eq_ignore_ascii_case(uuid))
     }
 
-    fn pop_speakerdata_by_uuid(&mut self, uuid: &str) -> Option<SpeakerData> {
+    pub fn pop_speakerdata_by_uuid(&mut self, uuid: &str) -> Option<SpeakerData> {
         self.speakerdata
             .iter()
             .position(|s| s.speaker.uuid().eq_ignore_ascii_case(uuid))
             .map(|idx| self.speakerdata.swap_remove(idx))
     }
 
-    fn get_coordinator_for_name(&self, name: &str) -> Option<&Speaker> {
+    pub fn get_coordinator_for_name(&self, name: &str) -> Option<&Speaker> {
         let speaker = self.get_speaker_with_name(name)?;
         self.get_coordinator_for_uuid(speaker.uuid())
     }
 
-    fn get_coordinatordata_for_name(&self, name: &str) -> Option<&SpeakerData> {
+    pub fn get_coordinatordata_for_name(&self, name: &str) -> Option<&SpeakerData> {
         let speaker = self.get_speaker_with_name(name)?;
         self.get_coordinatordata_for_uuid(speaker.uuid())
     }
 
-    fn get_coordinator_for_uuid(&self, speaker_uuid: &str) -> Option<&Speaker> {
+    pub fn get_coordinator_for_uuid(&self, speaker_uuid: &str) -> Option<&Speaker> {
         let coordinator_uuid = self.topology.iter().find_map(|(coordinator_uuid, uuids)| {
             uuids
                 .iter()
@@ -449,7 +450,7 @@ impl Controller {
         self.get_speaker_by_uuid(coordinator_uuid)
     }
 
-    fn get_coordinatordata_for_uuid(&self, speaker_uuid: &str) -> Option<&SpeakerData> {
+    pub fn get_coordinatordata_for_uuid(&self, speaker_uuid: &str) -> Option<&SpeakerData> {
         let coordinator_uuid = self.topology.iter().find_map(|(coordinator_uuid, uuids)| {
             uuids
                 .iter()
@@ -459,7 +460,7 @@ impl Controller {
         self.get_speakerdata_by_uuid(coordinator_uuid)
     }
 
-    fn update_avtransport_data(&mut self, uuid: Uuid, data: Vec<(String, String)>) {
+    pub fn update_avtransport_data(&mut self, uuid: Uuid, data: Vec<(String, String)>) {
         match self
             .speakerdata
             .iter_mut()
