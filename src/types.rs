@@ -13,6 +13,12 @@ pub enum Response {
     Queue(Vec<Track>),
 }
 
+#[derive(Debug)]
+pub enum ControllerStatus {
+    Ok(Topology),
+    Error,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
     TopoUpdate(Option<Uuid>, Topology),
@@ -23,9 +29,9 @@ pub enum Event {
 
 pub type Uuid = String;
 pub type CmdSender = mpsc::Sender<Command>;
+pub type CmdReceiver = mpsc::Receiver<Command>;
 pub type EventReceiver = tokio::sync::watch::Receiver<Event>;
 
-pub type ReducedTopology = Vec<(Uuid, Vec<Uuid>)>;
 pub type Topology = Vec<(Uuid, Vec<SpeakerInfo>)>;
 pub type AVStatus = Vec<(String, String)>;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -34,4 +40,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub type ZoneName = String;
 
 /// Type for response channel
-pub type Responder = oneshot::Sender<Response>;
+pub type ZoneActionResponder = oneshot::Sender<Response>;
+
+/// Type for status response channel
+pub type StatusResponder = oneshot::Sender<ControllerStatus>;

@@ -5,7 +5,7 @@ use sonor::{RepeatMode, Snapshot, Speaker};
 use super::Controller;
 use crate::{
     controller::SpeakerData,
-    types::{Responder, Response},
+    types::{Response, ZoneActionResponder},
     Error, MediaSource, Result,
 };
 
@@ -38,9 +38,9 @@ impl ZoneAction {
     pub(super) async fn handle_action(
         self,
         controller: &Controller,
-        tx: Responder,
+        tx: ZoneActionResponder,
         name: String,
-    ) -> Result<()> {
+    ) {
         macro_rules! data_action {
             ($data:ident.$method:ident($payload:ident: $letmethod:ident) -> $res:ident($returnval:ident) ) => {{
                 if let Some($payload) = controller.$letmethod(&name) {
@@ -52,12 +52,13 @@ impl ZoneAction {
                     );
                     match $data.$method($payload).await {
                         Ok($returnval) => {
-                            return tx.send(Response::$res($returnval)).or_else(|_| Ok(()))
+                            let _ = tx.send(Response::$res($returnval));
+                            return;
                         }
                         Err(e) => log::warn!("Error: {}", e),
                     }
                 }
-                tx.send(Response::NotOk).ok();
+                let _ = tx.send(Response::NotOk).ok();
             }};
         }
         macro_rules! controller_action {
@@ -66,12 +67,13 @@ impl ZoneAction {
                     log::debug!("Attempting to {:#?} in {}", stringify!($method), name);
                     match $payload.$method($($data),*).await {
                         Ok($returnval) => {
-                            return tx.send(Response::$res($returnval)).or_else(|_| Ok(()))
+                            let _ = tx.send(Response::$res($returnval));
+                            return;
                         }
                         Err(e) => log::warn!("Error: {}", e),
                     }
                 }
-                tx.send(Response::NotOk).ok();
+                let _ = tx.send(Response::NotOk).ok();
             }};
         }
 
@@ -129,6 +131,7 @@ impl ZoneAction {
             }
             Exists => {
                 if controller
+                    .system
                     .speakerdata
                     .iter()
                     .any(|s| s.speaker.name() == name)
@@ -142,8 +145,6 @@ impl ZoneAction {
                 data_action!( number.set_rel_volume(coordinator: get_coordinator_for_name) -> Ok(__) )
             }
         }
-
-        Ok(())
     }
 }
 

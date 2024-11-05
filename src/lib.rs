@@ -10,25 +10,23 @@ mod metadata;
 mod subscriber;
 mod types;
 pub mod utils;
-mod zoneaction;
-
-#[cfg(test)]
-mod test;
 
 use controller::{Controller, SpeakerData};
 use sonor::{Snapshot, Track};
+use std::fmt::Write as _;
+use tokio::sync::mpsc;
 use tokio::{sync::oneshot, task::JoinHandle};
-use types::Result;
-use types::{CmdSender, Responder, Response, ZoneName};
+use types::{CmdSender, Response, ZoneActionResponder, ZoneName};
+use types::{Result, StatusResponder};
 
+use controller::zoneaction::ZoneAction;
 pub use error::Error;
 pub use mediasource::MediaSource;
-pub use zoneaction::ZoneAction;
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Manager {
-    controller_handle: Option<JoinHandle<Controller>>,
-    tx: Option<CmdSender>,
+    controller_handle: JoinHandle<()>,
+    tx: CmdSender,
 }
 
 #[derive(Debug)]
@@ -54,8 +52,6 @@ impl<'a> Zone<'a> {
         let (tx, rx) = oneshot::channel();
         self.manager
             .tx
-            .as_ref()
-            .ok_or(Error::ControllerNotInitialized)?
             .send(Command::DoZoneAction(tx, self.name.clone(), action))
             .await
             .map_err(|_| Error::ControllerOffline)?;
@@ -87,33 +83,29 @@ impl Manager {
     /// Try to create a new manager to control the first sonos system found on
     /// the network. If a system cannot be found, an error is returned.
     pub async fn try_new() -> Result<Manager> {
-        let controller = Controller::new();
-        Self::try_new_with_controller(controller).await
+        Self::try_new_with_room(None).await
     }
 
     /// Try to create a new manager to control a sonos system that has a
     /// speaker with a certain room name. If the room name does not match any
     /// existing system, an error is returned.
-    pub async fn new_with_roomname(room: &str) -> Result<Manager> {
-        let mut controller = Controller::new();
-        controller.seed_by_roomname(room).await?;
-        Self::try_new_with_controller(controller).await
-    }
-
-    async fn try_new_with_controller(mut controller: Controller) -> Result<Manager> {
-        let tx = Some(controller.init().await?);
-        log::debug!("Initialized controller with devices:");
-        for device in controller.speakers().iter() {
-            log::debug!("     - {}", device.name());
-        }
-
-        let controller_handle = Some(tokio::spawn(async move {
-            if let Err(e) = controller.run().await {
-                log::error!("Controller shut down: {}", e)
-            };
-            log::debug!("Controller terminated on purpose?");
+    pub async fn try_new_with_room(room: Option<String>) -> Result<Manager> {
+        let (tx, rx) = mpsc::channel(32);
+        let mut controller = Controller::new(rx, room);
+        controller.init().await?;
+        log::debug!(
+            "Initialized controller with devices:\n{}",
             controller
-        }));
+                .system
+                .speakers()
+                .iter()
+                .fold(String::new(), |mut acc, device| {
+                    let _ = writeln!(acc, "     - {}", device.name());
+                    acc
+                })
+        );
+
+        let controller_handle = tokio::spawn(async move { controller.run().await });
 
         Ok(Manager {
             controller_handle,
@@ -137,14 +129,14 @@ impl Manager {
 impl Drop for Manager {
     // The controller should shut down when we drop the transmitter, but just in case.
     fn drop(&mut self) {
-        log::debug!("Dropping manager",);
-        self.controller_handle.as_ref().map(JoinHandle::abort);
+        self.controller_handle.abort();
     }
 }
 
 #[derive(Debug)]
 pub enum Command {
-    DoZoneAction(Responder, ZoneName, ZoneAction),
+    DoZoneAction(ZoneActionResponder, ZoneName, ZoneAction),
+    GetStatus(StatusResponder),
     // Browse or search media
     // Subscribe to events
     // Management of controller?

@@ -15,7 +15,7 @@ use super::{
 };
 
 const TIMEOUT_SEC: u32 = 300;
-const RENEW_SEC: u32 = 60;
+const RENEW_SEC: u64 = 60;
 
 type Sender = tokio::sync::watch::Sender<Event>;
 
@@ -23,31 +23,30 @@ type Sender = tokio::sync::watch::Sender<Event>;
 /// that will carry the latest data. Will handle resubscribing as long as there
 /// are still receiver handles. Once all receiver handles are dropped, the
 /// subscriber will shutdown and will need to be recreated.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct Subscriber {
-    service: Option<sonor::rupnp::Service>,
-    url: Option<sonor::rupnp::http::Uri>,
+    service: sonor::rupnp::Service,
+    url: sonor::rupnp::http::Uri,
     pub uuid: Option<Uuid>,
     task_handle: Option<JoinHandle<Result<Sender>>>,
 }
 
 impl Subscriber {
-    pub fn new() -> Subscriber {
-        Subscriber::default()
-    }
-
-    pub fn subscribe(
-        &mut self,
+    pub fn new(
         service: sonor::rupnp::Service,
         url: sonor::rupnp::http::Uri,
         uuid: Option<Uuid>,
-    ) -> Result<EventReceiver> {
-        // Clone all so they can be moved later into async task
-        self.service = Some(service);
-        self.uuid = uuid;
-        self.url = Some(url);
+    ) -> Subscriber {
+        Subscriber {
+            service,
+            url,
+            uuid,
+            task_handle: None,
+        }
+    }
 
-        if self.service.as_ref().unwrap().service_type() == AV_TRANSPORT && self.uuid.is_none() {
+    pub fn subscribe(&mut self) -> Result<EventReceiver> {
+        if self.service.service_type() == AV_TRANSPORT && self.uuid.is_none() {
             return Err(SubscriberError(
                 "Need UUID for AV_TRANSPORT Subscriptions!".into(),
             ));
@@ -69,16 +68,8 @@ impl Subscriber {
     /// goes offline. This function returns an error if service and url are not set.
     pub fn spawn_task(&mut self, tx: Sender) -> Result<()> {
         use Event::*;
-        let service = self
-            .service
-            .as_ref()
-            .ok_or_else(|| SubscriberError("No service defined!".to_string()))?
-            .clone();
-        let url = self
-            .url
-            .as_ref()
-            .ok_or_else(|| SubscriberError("No url defined!".to_string()))?
-            .clone();
+        let service = self.service.clone();
+        let url = self.url.clone();
         let uuid = self.uuid.clone();
 
         let task_handle = tokio::spawn(async move {
@@ -89,7 +80,7 @@ impl Subscriber {
                         .ok();
                     sonor::Error::UPnP(err)
                 })?;
-            let mut interval = time::interval(Duration::from_millis((RENEW_SEC * 1000).into()));
+            let mut interval = time::interval(Duration::from_secs(RENEW_SEC));
             loop {
                 // Select over reading from the subscription stream, aborting
                 // due to no more subscribers, and resubscription timer

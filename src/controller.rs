@@ -2,31 +2,29 @@
 
 //! API backend for tracking sonos system topology
 
+pub(crate) mod zoneaction;
+
 use crate::{
     subscriber::Subscriber,
-    types::{
-        AVStatus, CmdSender, Event, EventReceiver, ReducedTopology, Responder, Topology, Uuid,
-    },
-    zoneaction::ZoneAction,
+    types::{AVStatus, CmdReceiver, Event, EventReceiver, Topology, Uuid, ZoneActionResponder},
     Command, Error, Result,
 };
+use zoneaction::ZoneAction;
 
-use futures_util::stream::{SelectAll, StreamExt};
-use log::{debug, warn};
+use futures_util::{stream::SelectAll, FutureExt as _};
+use log::{debug, info, warn};
 use sonor::{
     discover_one, find,
     urns::{AV_TRANSPORT, ZONE_GROUP_TOPOLOGY},
-    Service, Speaker, SpeakerInfo, Uri, URN,
+    Speaker,
 };
 use std::fmt::Write as _;
 use std::time::Duration;
-use tokio::{select, sync::mpsc};
-use tokio_stream::wrappers::WatchStream;
-
-type CmdReceiver = mpsc::Receiver<Command>;
+use tokio::select;
+use tokio_stream::{wrappers::WatchStream, StreamExt as _};
 
 #[derive(Debug)]
-pub struct SpeakerData {
+pub(crate) struct SpeakerData {
     pub speaker: Speaker,
     transport_subscription: Option<Subscriber>,
     pub transport_data: AVStatus,
@@ -50,7 +48,7 @@ impl SpeakerData {
             .find(|(k, _)| k.eq_ignore_ascii_case("CurrentTrack"))
         {
             Some((_, track_no)) => {
-                log::debug!("Using cached current track no: {}", track_no);
+                debug!("Using cached current track no: {}", track_no);
                 track_no.parse().map_err(|_| Error::ContentNotFound)
             }
             None => self
@@ -64,63 +62,39 @@ impl SpeakerData {
 }
 
 #[derive(Debug, Default)]
-/// The controller owns the Speakers and keeps track of the topology
-/// so it can perform actions using the appropriate coordinating speakers.
-pub struct Controller {
+pub(crate) struct System {
     pub speakerdata: Vec<SpeakerData>,
-    topology: ReducedTopology,
-    topology_subscription: Subscriber,
+    topology: Topology,
     queued_event_handles: Vec<EventReceiver>,
-    rx: Option<CmdReceiver>,
-    seed: Option<Speaker>,
+    topology_subscription: Option<Subscriber>,
+    seed: Option<String>,
 }
 
-impl Controller {
-    /// Get a controller.
-    pub fn new() -> Controller {
-        Controller::default()
-    }
-
-    /// Initialize the controller
-    ///     * Discover speakers and topology
-    ///     * Return Sender for sending commands
-    pub async fn init(&mut self) -> Result<CmdSender> {
-        self.discover_system().await?;
-        let (tx, rx) = mpsc::channel(32);
-        self.rx = Some(rx);
-        Ok(tx)
-    }
-
-    /// If there are multiple sonos systems on the network, we can specify that
-    /// we want the discovered system to have a speaker with certain name.
-    /// Otherwise, the first speaker found will define the system and be used
-    /// to build the system topology.
-    pub async fn seed_by_roomname(&mut self, name: &str) -> Result<()> {
-        log::debug!("Looking for seed {}...", name);
-        let maybe_speaker = find(name, Duration::from_secs(5)).await?;
-        if let Some(speaker) = maybe_speaker {
-            self.seed = Some(speaker);
-        } else {
-            log::debug!("... got {:?} instead", maybe_speaker);
-            return Err(Error::ZoneDoesNotExist);
+impl System {
+    fn new(seed: Option<String>) -> System {
+        System {
+            seed,
+            ..Default::default()
         }
-        log::debug!("   ...found!");
-        Ok(())
     }
 
-    async fn discover_system(&mut self) -> Result<()> {
-        let topology = match self.seed.as_ref() {
-            Some(speaker) => speaker.zone_group_state().await?,
-            None => {
-                discover_one(Duration::from_secs(5))
-                    .await?
-                    .zone_group_state()
-                    .await?
-            }
+    async fn discover(&mut self) -> Result<()> {
+        let topology = if let Some(ref room) = self.seed {
+            debug!("Looking for seed: {}", room);
+            find(room, Duration::from_secs(5))
+                .await?
+                .ok_or(Error::ZoneDoesNotExist)?
+                .zone_group_state()
+                .await?
+        } else {
+            discover_one(Duration::from_secs(5))
+                .await?
+                .zone_group_state()
+                .await?
         };
-        self.update_from_topology(topology)
-            .await
-            .unwrap_or_else(|err| warn!("Error updating system topology: {:?}", err));
+
+        self.update_from_topology(topology).await?;
+        self.update_topology_subscription()?;
         Ok(())
     }
 
@@ -130,32 +104,20 @@ impl Controller {
     }
 
     /// Update speakers and topology
-    async fn update_from_topology(&mut self, system_topology: Topology) -> Result<()> {
-        let topology: ReducedTopology = system_topology
-            .iter()
-            .map(|(uuid, infos)| {
-                (
-                    uuid.to_owned(),
-                    infos.iter().map(|info| info.uuid().to_owned()).collect(),
-                )
-            })
-            .collect();
-        let infos: Vec<SpeakerInfo> = system_topology
-            .into_iter()
-            .flat_map(|(_, infos)| infos)
-            .collect();
+    async fn update_from_topology(&mut self, topology: Topology) -> Result<()> {
+        let infos = topology.iter().flat_map(|(_, infos)| infos);
 
         // Drop speakers and subscriptions that are no longer in the topology
         // Todo: (speakers, av_transport_data, subscription) should probably be
         // a single tuple. Seems like we search them all together alot
         self.speakerdata.retain(|sd| {
             infos
-                .iter()
+                .clone()
                 .any(|info| info.uuid().eq_ignore_ascii_case(sd.speaker.uuid()))
         });
 
         // Check if we have any new speakers in the system and add them. Update speaker info otherwise
-        for info in infos.into_iter() {
+        for info in infos {
             if let Some(speakerdata) = self
                 .speakerdata
                 .iter_mut()
@@ -164,15 +126,14 @@ impl Controller {
                 speakerdata.speaker.set_name(info.name().into());
                 speakerdata.speaker.set_location(info.location().into());
             } else {
-                let new_speaker = Speaker::from_speaker_info(&info)
+                let new_speaker = Speaker::from_speaker_info(info)
                     .await?
                     .ok_or(sonor::Error::SpeakerNotIncludedInOwnZoneGroupState)?;
 
                 // Subscribe to AV Transport events on new speakers
                 let mut new_speakerdata = SpeakerData::new(new_speaker);
-                if let Some((device_sub, rx)) = self
-                    .get_av_transport_subscription(&new_speakerdata.speaker)
-                    .await
+                if let Some((device_sub, rx)) =
+                    get_av_transport_subscription(&new_speakerdata.speaker).await
                 {
                     new_speakerdata.transport_subscription = Some(device_sub);
                     self.queued_event_handles.push(rx);
@@ -186,50 +147,65 @@ impl Controller {
         Ok(())
     }
 
-    async fn get_av_transport_subscription(
-        &mut self,
-        new_speaker: &Speaker,
-    ) -> Option<(Subscriber, EventReceiver)> {
-        let mut device_sub = Subscriber::new();
-        if let Some(service) = new_speaker.device().find_service(AV_TRANSPORT) {
-            if let Ok(rx) = device_sub.subscribe(
-                service.clone(),
-                new_speaker.device().url().clone(),
-                Some(new_speaker.uuid().to_owned()),
-            ) {
-                return Some((device_sub, rx));
-            }
-        }
-        None
-    }
-
-    fn get_a_service_and_url(&self, urn: &URN) -> Result<(Service, Uri)> {
-        let speaker = if !self.speakerdata.is_empty() {
-            // Chose a random speaker. We may have lost subscription to topology
-            // because the last speaker went offline.. and we don't know.
-            // There's a chance we can recover quickly if we find an extant speaker.
-            let i = fastrand::usize(..self.speakerdata.len());
-            &self.speakerdata.get(i).unwrap().speaker
-        } else {
+    fn update_topology_subscription(&mut self) -> Result<()> {
+        if self.speakerdata.is_empty() {
             return Err(sonor::Error::NoSpeakersDetected.into());
-        };
-
-        speaker
-            .device()
-            .find_service(urn)
+        }
+        // Chose a random speaker. We may have lost subscription to topology
+        // because the last speaker went offline.. and we don't know.
+        // There's a chance we can recover quickly if we find an extant speaker.
+        let i = fastrand::usize(..self.speakerdata.len());
+        let device = self.speakerdata[i].speaker.device();
+        let (service, url) = device
+            .find_service(ZONE_GROUP_TOPOLOGY)
             .ok_or(sonor::Error::MissingServiceForUPnPAction {
-                service: urn.clone(),
+                service: ZONE_GROUP_TOPOLOGY.clone(),
                 action: String::new(),
                 payload: String::new(),
             })
-            .map_err(Error::from)
-            .map(|service| (service.clone(), speaker.device().url().clone()))
+            .map(|service| (service.clone(), device.url().clone()))?;
+        let mut sub = Subscriber::new(service, url, None);
+        self.queued_event_handles.push(sub.subscribe()?);
+        self.topology_subscription = Some(sub);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+/// The controller owns the Speakers and keeps track of the topology
+/// so it can perform actions using the appropriate coordinating speakers.
+/// It is constructed and then moved into a thread/task.
+pub(crate) struct Controller {
+    pub system: System,
+    rx: CmdReceiver,
+}
+
+impl Controller {
+    /// Make a new controller -- an "actor" that will handle maintenance of
+    /// the sonos system state and dispatch commands to groups of speakers.
+    ///
+    /// If there are multiple sonos systems on the network, we can specify that
+    /// we want the discovered system to have a speaker with certain name.
+    /// Otherwise, the first speaker found will define the system and be used
+    /// to build the system topology.
+    pub fn new(rx: CmdReceiver, seed_room: Option<String>) -> Self {
+        let system = System::new(seed_room);
+        Controller { system, rx }
     }
 
-    /// Handle events. Deal with errors here. Only return an error if it is
-    /// unrecoverable and should break the non-event loop, e.g. all speakers
-    /// offline.
-    async fn handle_event(&mut self, event: Event) -> Result<()> {
+    pub async fn init(&mut self) -> Result<()> {
+        self.system.discover().await.map_err(|e| {
+            info!("Unable to discover system: {}", e);
+            e
+        })?;
+        self.system.update_topology_subscription().map_err(|e| {
+            info!("Unable to get topology subscription: {}", e);
+            e
+        })
+    }
+
+    /// Handle events.
+    async fn handle_event(&mut self, event: Event) {
         use Event::*;
         match event {
             TopoUpdate(_uuid, topology) => {
@@ -247,7 +223,8 @@ impl Controller {
                         acc
                     })
                 );
-                self.update_from_topology(topology)
+                self.system
+                    .update_from_topology(topology)
                     .await
                     .unwrap_or_else(|err| warn!("Error updating system topology: {:?}", err))
             }
@@ -279,9 +256,6 @@ impl Controller {
                     warn!("Missing UUID for AV Transport update")
                 }
             }
-            // Todo: forward updates to subscribers. Zone updates should always
-            // come from Controller. Non-contorllers send updates but don't
-            // know what the4y are playing
             SubscribeError(uuid, urn) => {
                 debug!(
                     "Subscription {} on {} lost",
@@ -293,18 +267,15 @@ impl Controller {
                 match urn.typ() {
                     "ZoneGroupTopology" => {
                         // The speaker we were getting updates from may have gone offline. Try another
-                        let (service, url) = self.get_a_service_and_url(ZONE_GROUP_TOPOLOGY)?;
-                        self.topology_subscription = Subscriber::new();
-                        match self.topology_subscription.subscribe(service, url, None) {
-                            Ok(rx) => self.queued_event_handles.push(rx),
-                            Err(err) => {
-                                log::warn!(
-                                    "Having trouble subscribing to topology updates: {}",
-                                    err
-                                );
-                                log::warn!("  ...attempting to rediscover system");
-                                self.discover_system().await.map(|_| ())?;
-                                log::warn!("  ...success!");
+                        if let Err(err) = self.system.update_topology_subscription() {
+                            info!("Having trouble subscribing to topology updates: {}", err);
+                            info!("  ...attempting to rediscover system");
+                            match self.system.discover().await {
+                                Ok(_) => info!("  ...success!"),
+                                Err(err) => {
+                                    info!("  ...failed: {}", err);
+                                    self.system.topology_subscription.take();
+                                }
                             }
                         }
                     }
@@ -313,25 +284,23 @@ impl Controller {
                         // offline or gotten a new IP. In case its the later,
                         // the SpeakerInfo and Device could be out of sync
                         let uuid = &uuid.unwrap();
-                        if let Some(mut speakerdata) = self.pop_speakerdata_by_uuid(uuid) {
+                        if let Some(speakerdata) = self.get_mut_speakerdata_by_uuid(uuid) {
                             if let Ok(Some(speaker)) =
                                 Speaker::from_speaker_info(speakerdata.speaker.info()).await
                             {
                                 // The speaker still exists! Resubscribe
-                                log::debug!(
+                                debug!(
                                     "Recreating speaker {}. Did it's IP change?",
                                     speaker.name()
                                 );
-                                match self.get_av_transport_subscription(&speaker).await {
+                                match get_av_transport_subscription(&speaker).await {
                                     Some((sub, rx)) => {
                                         speakerdata.transport_subscription = Some(sub);
-                                        self.queued_event_handles.push(rx);
+                                        self.system.queued_event_handles.push(rx);
                                     }
                                     None => speakerdata.transport_subscription = None,
                                 }
                             }
-                            // Put the speakerdata back. If speaker is gone, next topo update will clean it up
-                            self.speakerdata.push(speakerdata);
                         }
                     }
                     _ => (),
@@ -339,95 +308,114 @@ impl Controller {
             }
             NoOp => (),
         };
-        Ok(())
     }
 
     /// Handle zone actions. Deal with errors here. Only return an error if it
     /// is unrecoverable and should break the non-event loop.
-    async fn handle_zone_action(
-        &self,
-        tx: Responder,
-        name: String,
-        action: ZoneAction,
-    ) -> Result<()> {
-        debug!("Got {:?}", action);
+    async fn handle_zone_action(&self, tx: ZoneActionResponder, name: String, action: ZoneAction) {
+        debug!("Handling action {:?} for zone {}", action, name);
         action.handle_action(self, tx, name).await
     }
 
     /// Run the event loop.
     ///
-    /// - Subscribe and listen to events on the sonos system
-    /// - Keep system state up-to-date
+    /// - Subscribe and listen to events on the sonos system, maintaining
+    ///   the system state up-to-date.
+    /// - Rediscover system as needed
     /// - Listen for commands from clients to perform actions on zones.
-    ///
-    /// Will return an error if system goes offline.
-    ///
-    /// Whether this function returns an error or not, the reciever will drop
-    /// and the controller will need to be re-initialized.
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) {
         use Command::*;
 
         let mut event_stream = SelectAll::new();
-        // Subscribe for topology updates. Any device will do.
-        let (service, url) = self.get_a_service_and_url(ZONE_GROUP_TOPOLOGY)?;
-        let topo_rx = self.topology_subscription.subscribe(service, url, None)?;
-        event_stream.push(WatchStream::new(topo_rx));
-
-        let mut rx = self.rx.take().ok_or(Error::ControllerNotInitialized)?;
 
         debug!("Listening for commands");
-        loop {
-            event_stream.extend(self.queued_event_handles.drain(..).map(WatchStream::new));
+        'outer: loop {
+            event_stream.extend(
+                self.system
+                    .queued_event_handles
+                    .drain(..)
+                    .map(WatchStream::new),
+            );
+            if self.system.topology_subscription.is_none() {
+                let now = tokio::time::Instant::now();
+                info!("Lost system. Rediscovering...");
+                match self.init().await {
+                    Ok(_) => info!("  ...success!"),
+                    Err(err) => {
+                        info!("  ...failed: {}", err);
+                        // Handle any pending commands without awaiting
+                        'inner: loop {
+                            match self.rx.try_recv() {
+                                Ok(Command::DoZoneAction(tx, name, action)) => {
+                                    self.handle_zone_action(tx, name, action).await;
+                                }
+                                Ok(Command::GetStatus(_sender)) => {
+                                    todo!()
+                                }
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break 'inner,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                                    break 'outer
+                                }
+                            }
+                        }
+
+                        // Handle any pending events without awaiting
+                        while let Some(Some(event)) = event_stream.next().now_or_never() {
+                            self.handle_event(event).await;
+                        }
+                        tokio::time::sleep(Duration::from_secs(1).saturating_sub(now.elapsed()))
+                            .await;
+                        continue 'outer;
+                    }
+                }
+            }
             select! {
-                maybe_command = rx.recv() => match maybe_command {
+                maybe_command = self.rx.recv() => match maybe_command {
                     Some(cmd) => match cmd {
-                        DoZoneAction(tx, name, action) => self.handle_zone_action(tx, name, action).await?,
-                    },
+                        DoZoneAction(tx,name,action)=>self.handle_zone_action(tx,name,action).await,
+                        GetStatus(_sender) => todo!(), },
                     None => break
                 },
                 maybe_event = event_stream.next() => match maybe_event {
-                    Some(event) => self.handle_event(event).await?,
-                    None => warn!("No active subscriptions... all devices unreachable?"),
+                    Some(event) => self.handle_event(event).await,
+                    None => info!("No active subscriptions... all devices unreachable?"),
                 }
             }
         }
-        // put reciever back if we exit gracefully?
-        // self.rx = Some(rx);
-        debug!("aborting");
-        // self.topology_subscription.shutdown().await
-        Ok(())
+        debug!("Controller loop finished");
     }
 
-    pub fn get_speaker_with_name(&self, name: &str) -> Option<&Speaker> {
-        self.speakerdata
-            .iter()
-            .find_map(|s| match s.speaker.name().eq_ignore_ascii_case(name) {
+    fn get_speaker_with_name(&self, name: &str) -> Option<&Speaker> {
+        self.system.speakerdata.iter().find_map(|s| {
+            match s.speaker.name().eq_ignore_ascii_case(name) {
                 true => Some(&s.speaker),
                 false => None,
-            })
+            }
+        })
     }
 
-    pub fn get_speaker_by_uuid(&self, uuid: &str) -> Option<&Speaker> {
-        self.speakerdata
-            .iter()
-            .find_map(|s| match s.speaker.uuid().eq_ignore_ascii_case(uuid) {
+    fn get_speaker_by_uuid(&self, uuid: &str) -> Option<&Speaker> {
+        self.system.speakerdata.iter().find_map(|s| {
+            match s.speaker.uuid().eq_ignore_ascii_case(uuid) {
                 true => Some(&s.speaker),
                 false => None,
-            })
+            }
+        })
     }
 
-    pub fn get_speakerdata_by_uuid(&self, uuid: &str) -> Option<&SpeakerData> {
-        self.speakerdata
+    fn get_speakerdata_by_uuid(&self, uuid: &str) -> Option<&SpeakerData> {
+        self.system
+            .speakerdata
             .iter()
             .find(|s| s.speaker.uuid().eq_ignore_ascii_case(uuid))
     }
 
-    pub fn pop_speakerdata_by_uuid(&mut self, uuid: &str) -> Option<SpeakerData> {
-        self.speakerdata
-            .iter()
-            .position(|s| s.speaker.uuid().eq_ignore_ascii_case(uuid))
-            .map(|idx| self.speakerdata.swap_remove(idx))
+    fn get_mut_speakerdata_by_uuid(&mut self, uuid: &str) -> Option<&mut SpeakerData> {
+        self.system
+            .speakerdata
+            .iter_mut()
+            .find(|s| s.speaker.uuid().eq_ignore_ascii_case(uuid))
     }
 
     pub fn get_coordinator_for_name(&self, name: &str) -> Option<&Speaker> {
@@ -440,28 +428,37 @@ impl Controller {
         self.get_coordinatordata_for_uuid(speaker.uuid())
     }
 
-    pub fn get_coordinator_for_uuid(&self, speaker_uuid: &str) -> Option<&Speaker> {
-        let coordinator_uuid = self.topology.iter().find_map(|(coordinator_uuid, uuids)| {
-            uuids
+    fn get_coordinator_for_uuid(&self, speaker_uuid: &str) -> Option<&Speaker> {
+        let coordinator_uuid =
+            self.system
+                .topology
                 .iter()
-                .find(|&uuid| uuid.eq_ignore_ascii_case(speaker_uuid))
-                .and(Some(coordinator_uuid))
-        })?;
+                .find_map(|(coordinator_uuid, uuids)| {
+                    uuids
+                        .iter()
+                        .find(|&info| info.uuid().eq_ignore_ascii_case(speaker_uuid))
+                        .and(Some(coordinator_uuid))
+                })?;
         self.get_speaker_by_uuid(coordinator_uuid)
     }
 
-    pub fn get_coordinatordata_for_uuid(&self, speaker_uuid: &str) -> Option<&SpeakerData> {
-        let coordinator_uuid = self.topology.iter().find_map(|(coordinator_uuid, uuids)| {
-            uuids
+    fn get_coordinatordata_for_uuid(&self, speaker_uuid: &str) -> Option<&SpeakerData> {
+        let coordinator_uuid =
+            self.system
+                .topology
                 .iter()
-                .find(|&uuid| uuid.eq_ignore_ascii_case(speaker_uuid))
-                .and(Some(coordinator_uuid))
-        })?;
+                .find_map(|(coordinator_uuid, uuids)| {
+                    uuids
+                        .iter()
+                        .find(|&info| info.uuid().eq_ignore_ascii_case(speaker_uuid))
+                        .and(Some(coordinator_uuid))
+                })?;
         self.get_speakerdata_by_uuid(coordinator_uuid)
     }
 
-    pub fn update_avtransport_data(&mut self, uuid: Uuid, data: Vec<(String, String)>) {
+    fn update_avtransport_data(&mut self, uuid: Uuid, data: Vec<(String, String)>) {
         match self
+            .system
             .speakerdata
             .iter_mut()
             .find(|sd| sd.speaker.uuid().eq_ignore_ascii_case(&uuid))
@@ -477,6 +474,61 @@ impl Controller {
     /// Drop a speaker for no good reason
     #[cfg(test)]
     pub fn _drop_speaker(&mut self) {
-        self.speakerdata.pop().unwrap();
+        self.system.speakerdata.pop().unwrap();
+    }
+}
+
+async fn get_av_transport_subscription(
+    new_speaker: &Speaker,
+) -> Option<(Subscriber, EventReceiver)> {
+    if let Some(service) = new_speaker.device().find_service(AV_TRANSPORT) {
+        let mut device_sub = Subscriber::new(
+            service.clone(),
+            new_speaker.device().url().clone(),
+            Some(new_speaker.uuid().to_owned()),
+        );
+        if let Ok(rx) = device_sub.subscribe() {
+            return Some((device_sub, rx));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod test {
+    use tokio::sync::mpsc;
+
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[tokio::test]
+    async fn test_controller() -> Result<()> {
+        simple_logger::init_with_level(log::Level::Debug).unwrap();
+        let handle = {
+            let (_tx, rx) = mpsc::channel(10);
+            let mut controller = Controller::new(rx, None);
+            controller.init().await?;
+
+            log::info!("Initialized manager with devices:");
+            for device in controller.system.speakers().iter() {
+                log::info!("     - {}", device.name());
+            }
+
+            controller._drop_speaker();
+
+            log::info!("Now we have:");
+            for device in controller.system.speakers().iter() {
+                log::info!("     - {}", device.name());
+            }
+
+            let handle = tokio::spawn(async move {
+                controller.run().await;
+            });
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            handle
+        }; // drop _tx
+        handle.await.unwrap();
+        Ok(())
     }
 }
